@@ -1,0 +1,208 @@
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
+import io
+
+# Phạm vi quyền truy cập Google Drive
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+# Biến toàn cục
+service = None
+folder_dict = {}
+
+# Đăng nhập vào Google Drive
+def login_google_drive():
+    global service
+
+    creds = None
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+        creds = flow.run_local_server(port=0)
+
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
+
+    service = build("drive", "v3", credentials=creds)
+    messagebox.showinfo("Thành công", "Đăng nhập thành công!")
+    build_folder_tree()
+
+# Lấy danh sách thư mục và file trong Google Drive
+def get_drive_structure(parent_id=None):
+    query = f"'{parent_id}' in parents" if parent_id else "'root' in parents"
+    
+    results = service.files().list(
+        q=query,
+        fields="files(id, name, mimeType, parents)"
+    ).execute()
+
+    files = results.get("files", [])
+    return files
+
+# Xây dựng cây thư mục trong UI
+def build_folder_tree():
+    if service is None:
+        messagebox.showerror("Lỗi", "Bạn chưa đăng nhập vào Google Drive!")
+        return
+
+    tree.delete(*tree.get_children())
+    folder_dict.clear()
+    
+    root_node = tree.insert("", "end", "root", text="📁 Google Drive", open=True)
+    folder_dict["root"] = None
+    
+    def add_nodes(parent_id, parent_node):
+        items = get_drive_structure(parent_id)
+        for item in items:
+            item_name = f"📂 {item['name']}" if item["mimeType"] == "application/vnd.google-apps.folder" else f"📄 {item['name']}"
+            node = tree.insert(parent_node, "end", item["id"], text=item_name, open=False)
+            folder_dict[item["id"]] = item["id"]
+            
+            if item["mimeType"] == "application/vnd.google-apps.folder":
+                add_nodes(item["id"], node)
+
+    add_nodes(None, root_node)
+
+# Xử lý khi chọn thư mục trong cây
+def on_tree_select(event):
+    selected_item = tree.focus()
+    selected_folder_id = folder_dict.get(selected_item, None)
+    list_files(selected_folder_id)
+
+# Liệt kê file trong thư mục đã chọn
+def list_files(folder_id):
+    if service is None:
+        messagebox.showerror("Lỗi", "Bạn chưa đăng nhập vào Google Drive!")
+        return
+
+    file_listbox.delete(0, tk.END)
+    files = get_drive_structure(folder_id)
+    
+    for file in files:
+        if file["mimeType"] != "application/vnd.google-apps.folder":
+            file_listbox.insert(tk.END, file["name"])
+
+# Upload file vào thư mục đã chọn
+def upload_file():
+    if service is None:
+        messagebox.showerror("Lỗi", "Bạn chưa đăng nhập vào Google Drive!")
+        return
+
+    selected_item = tree.focus()
+    parent_id = folder_dict.get(selected_item, None)
+
+    file_path = filedialog.askopenfilename()
+    if not file_path:
+        return
+
+    file_name = os.path.basename(file_path)
+    file_metadata = {"name": file_name}
+    if parent_id:
+        file_metadata["parents"] = [parent_id]
+
+    media = MediaFileUpload(file_path, resumable=True)
+    service.files().create(body=file_metadata, media_body=media).execute()
+
+    messagebox.showinfo("Thành công", f"File {file_name} đã được upload!")
+    list_files(parent_id)
+
+# Tạo thư mục mới
+def create_folder():
+    if service is None:
+        messagebox.showerror("Lỗi", "Bạn chưa đăng nhập vào Google Drive!")
+        return
+
+    folder_name = filedialog.askstring("Tạo thư mục", "Nhập tên thư mục mới:")
+    if not folder_name:
+        return
+
+    selected_item = tree.focus()
+    parent_id = folder_dict.get(selected_item, None)
+
+    folder_metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    
+    if parent_id:
+        folder_metadata["parents"] = [parent_id]
+
+    folder = service.files().create(body=folder_metadata, fields="id").execute()
+    folder_dict[folder["id"]] = folder["id"]
+
+    messagebox.showinfo("Thành công", f"Thư mục '{folder_name}' đã được tạo!")
+    build_folder_tree()
+
+# Tải file về máy
+def download_file():
+    if service is None:
+        messagebox.showerror("Lỗi", "Bạn chưa đăng nhập vào Google Drive!")
+        return
+
+    selected_file = file_listbox.get(tk.ACTIVE)
+    if not selected_file:
+        messagebox.showerror("Lỗi", "Bạn chưa chọn file!")
+        return
+
+    results = service.files().list(q=f"name='{selected_file}'", fields="files(id, name)").execute()
+    files = results.get("files", [])
+    
+    if not files:
+        messagebox.showerror("Lỗi", "Không tìm thấy file!")
+        return
+
+    file_id = files[0]["id"]
+    save_path = filedialog.asksaveasfilename(initialfile=selected_file, defaultextension="")
+
+    if not save_path:
+        return
+
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(save_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request)
+
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+
+    messagebox.showinfo("Thành công", f"File {selected_file} đã được tải về {save_path}")
+
+# Giao diện UI
+root = tk.Tk()
+root.title("Google Drive Manager")
+root.geometry("700x500")
+
+frame_left = tk.Frame(root)
+frame_left.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+
+frame_right = tk.Frame(root)
+frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+tree = ttk.Treeview(frame_left)
+tree.pack(fill=tk.BOTH, expand=True)
+tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+file_listbox = tk.Listbox(frame_right, height=10)
+file_listbox.pack(fill=tk.BOTH, expand=True)
+
+btn_login = tk.Button(root, text="🔑 Đăng nhập", command=login_google_drive)
+btn_login.pack(pady=5)
+
+btn_create_folder = tk.Button(root, text="📂 Tạo Thư Mục", command=create_folder)
+btn_create_folder.pack(pady=5)
+
+btn_upload = tk.Button(root, text="⬆️ Upload File", command=upload_file)
+btn_upload.pack(pady=5)
+
+btn_download = tk.Button(root, text="⬇️ Tải File", command=download_file)
+btn_download.pack(pady=5)
+
+root.mainloop()
